@@ -14,6 +14,8 @@
  */
 package org.hyperledger.besu.ethereum.mainnet;
 
+import org.hyperledger.besu.ethereum.bal.BlockAccessList;
+import org.hyperledger.besu.ethereum.bal.tracing.BalOtelTracer;
 import org.hyperledger.besu.ethereum.bonsai.BonsaiPersistedWorldState;
 import org.hyperledger.besu.ethereum.bonsai.BonsaiWorldStateUpdater;
 import org.hyperledger.besu.ethereum.chain.Blockchain;
@@ -133,6 +135,8 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
 
   protected final TransactionGasBudgetCalculator gasBudgetCalculator;
 
+  protected final BalOtelTracer balTracer;
+
   protected AbstractBlockProcessor(
       final MainnetTransactionProcessor transactionProcessor,
       final TransactionReceiptFactory transactionReceiptFactory,
@@ -140,12 +144,25 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
       final MiningBeneficiaryCalculator miningBeneficiaryCalculator,
       final boolean skipZeroBlockRewards,
       final TransactionGasBudgetCalculator gasBudgetCalculator) {
+    this(transactionProcessor, transactionReceiptFactory, blockReward, miningBeneficiaryCalculator,
+        skipZeroBlockRewards, gasBudgetCalculator, null);
+  }
+
+  protected AbstractBlockProcessor(
+      final MainnetTransactionProcessor transactionProcessor,
+      final TransactionReceiptFactory transactionReceiptFactory,
+      final Wei blockReward,
+      final MiningBeneficiaryCalculator miningBeneficiaryCalculator,
+      final boolean skipZeroBlockRewards,
+      final TransactionGasBudgetCalculator gasBudgetCalculator,
+      final BalOtelTracer balTracer) {
     this.transactionProcessor = transactionProcessor;
     this.transactionReceiptFactory = transactionReceiptFactory;
     this.blockReward = blockReward;
     this.miningBeneficiaryCalculator = miningBeneficiaryCalculator;
     this.skipZeroBlockRewards = skipZeroBlockRewards;
     this.gasBudgetCalculator = gasBudgetCalculator;
+    this.balTracer = balTracer;
   }
 
   @Override
@@ -158,13 +175,32 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
       final PrivateMetadataUpdater privateMetadataUpdater) {
     final Span globalProcessBlock =
         tracer.spanBuilder("processBlock").setSpanKind(Span.Kind.INTERNAL).startSpan();
+        
+    // Start BAL tracing if enabled
+    final BlockAccessList bal = extractBlockAccessList(blockHeader, transactions);
+    final Span balBlockSpan = balTracer != null ? balTracer.startBlockProcessing(blockHeader, bal) : null;
+    
     try {
+      // Start BAL prefetch if available
+      if (balTracer != null && bal != null) {
+        balTracer.startPrefetch(bal);
+      }
+      
       final List<TransactionReceipt> receipts = new ArrayList<>();
       long currentGasUsed = 0;
+      int transactionIndex = 0;
       for (final Transaction transaction : transactions) {
         if (!hasAvailableBlockBudget(blockHeader, transaction, currentGasUsed)) {
+          if (balTracer != null) {
+            balTracer.failBlockProcessing("Insufficient block gas budget");
+          }
           return AbstractBlockProcessor.Result.failed();
         }
+
+        // Start transaction tracing
+        final Span txSpan = balTracer != null 
+            ? balTracer.startTransactionExecution(transaction, transactionIndex) 
+            : null;
 
         final WorldUpdater worldStateUpdater = worldState.updater();
         final BlockHashLookup blockHashLookup = new BlockHashLookup(blockHeader, blockchain);
@@ -183,26 +219,45 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
                 true,
                 TransactionValidationParams.processingBlock(),
                 privateMetadataUpdater);
+        final long gasUsed = transaction.getGasLimit() - result.getGasRemaining();
+        
         if (result.isInvalid()) {
           LOG.info(
               "Block processing error: transaction invalid '{}'. Block {} Transaction {}",
               result.getValidationResult().getInvalidReason(),
               blockHeader.getHash().toHexString(),
               transaction.getHash().toHexString());
+          
+          // Finish transaction span with error
+          if (balTracer != null && txSpan != null) {
+            balTracer.finishTransactionExecution(txSpan, gasUsed, false);
+          }
+          
           if (worldState instanceof BonsaiPersistedWorldState) {
             ((BonsaiWorldStateUpdater) worldStateUpdater).reset();
+          }
+          
+          if (balTracer != null) {
+            balTracer.failBlockProcessing("Transaction validation failed: " + 
+                result.getValidationResult().getInvalidReason());
           }
           return AbstractBlockProcessor.Result.failed();
         }
 
         worldStateUpdater.commit();
+        currentGasUsed += gasUsed;
 
-        currentGasUsed += transaction.getGasLimit() - result.getGasRemaining();
+        // Finish transaction span successfully
+        if (balTracer != null && txSpan != null) {
+          balTracer.finishTransactionExecution(txSpan, gasUsed, true);
+        }
 
         final TransactionReceipt transactionReceipt =
             transactionReceiptFactory.create(
                 transaction.getType(), result, worldState, currentGasUsed);
         receipts.add(transactionReceipt);
+        
+        transactionIndex++;
       }
 
       if (!rewardCoinbase(worldState, blockHeader, ommers, skipZeroBlockRewards)) {
@@ -210,10 +265,33 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
         if (worldState instanceof BonsaiPersistedWorldState) {
           ((BonsaiWorldStateUpdater) worldState.updater()).reset();
         }
+        
+        if (balTracer != null) {
+          balTracer.failBlockProcessing("Coinbase reward calculation failed");
+        }
         return AbstractBlockProcessor.Result.failed();
       }
 
+      // Start state root calculation tracing
+      final Span stateRootSpan = balTracer != null 
+          ? balTracer.startStateRootCalculation(
+              getAccountsUpdatedCount(), 
+              getStorageSlotsUpdatedCount(), 
+              false) // parallel processing not implemented in this version
+          : null;
+
       worldState.persist(blockHeader);
+
+      // Finish state root calculation
+      if (balTracer != null && stateRootSpan != null) {
+        balTracer.finishStateRootCalculation(stateRootSpan, blockHeader.getStateRoot());
+      }
+
+      // Finish block processing
+      if (balTracer != null) {
+        balTracer.finishBlockProcessing();
+      }
+
       return AbstractBlockProcessor.Result.successful(receipts);
     } finally {
       globalProcessBlock.end();
@@ -247,4 +325,42 @@ public abstract class AbstractBlockProcessor implements BlockProcessor {
       final BlockHeader header,
       final List<BlockHeader> ommers,
       final boolean skipZeroBlockRewards);
+
+  /**
+   * Extracts or creates a BlockAccessList for the given block.
+   * Since EIP-7928 BAL is not yet implemented, this returns null.
+   * This method should be overridden when BAL implementation is added.
+   *
+   * @param blockHeader The block header
+   * @param transactions List of transactions in the block
+   * @return BlockAccessList if available, null otherwise
+   */
+  protected BlockAccessList extractBlockAccessList(
+      final BlockHeader blockHeader, final List<Transaction> transactions) {
+    // TODO: Implement actual BAL extraction when EIP-7928 is implemented
+    // For now, return null since the BAL data structure is not populated
+    return null;
+  }
+
+  /**
+   * Gets the number of accounts updated during block processing.
+   * This is a placeholder implementation for state root calculation tracing.
+   *
+   * @return Number of accounts updated (placeholder value)
+   */
+  protected int getAccountsUpdatedCount() {
+    // TODO: Implement actual account tracking when needed
+    return 0; // Placeholder
+  }
+
+  /**
+   * Gets the number of storage slots updated during block processing.
+   * This is a placeholder implementation for state root calculation tracing.
+   *
+   * @return Number of storage slots updated (placeholder value)
+   */
+  protected int getStorageSlotsUpdatedCount() {
+    // TODO: Implement actual storage slot tracking when needed
+    return 0; // Placeholder
+  }
 }
