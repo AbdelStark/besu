@@ -229,4 +229,11 @@ export GRADLE_OPTS="-Xmx4g -XX:MaxMetaspaceSize=1g"
 - **Key management:** Node keys vs account keys confusion
 - **Port conflicts:** Default ports may clash with other services
 - **Disk space:** Mainnet requires 100GB+ for full node
-</troubleshooting>
+</troubleshooting>## Known Issues
+
+### Build Dependency Issue (2024)
+- JFrog Artifactory plugin dependency resolution fails
+- Error: Could not find org.jfrog.buildinfo:build-info-extractor:2.22.0
+- Workaround needed for full builds
+- Simple compilation verification: Java 11+ installed, Gradle wrapper works
+- Context files created without full build verification
