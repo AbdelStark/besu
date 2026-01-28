@@ -1,10 +1,11 @@
 # CLAUDE.md - Hyperledger Besu Agentic Context
 
 ## <identity>
-**Project:** Hyperledger Besu - Enterprise Ethereum client in Java  
+**Project:** Hyperledger Besu - Enterprise Ethereum client in Java (Fork)  
 **Type:** Production blockchain client (MainNet compatible)  
-**Scale:** ~50 modules, ~500k LoC, mission-critical financial infrastructure  
-**Complexity:** High - consensus, P2P networking, EVM, cryptography, enterprise features
+**Scale:** 47 modules, ~500k LoC, mission-critical financial infrastructure  
+**Complexity:** High - consensus, P2P networking, EVM, cryptography, enterprise features  
+**Fork Status:** Based on Besu 21.1.7-SNAPSHOT, may have build configuration differences
 </identity>
 
 ## <stack>
@@ -125,7 +126,8 @@ docker run besu --help      # Run containerized
 --consensus-mechanism=clique # Proof-of-Authority
 ```
 
-**⚠️ Commands verified on Ubuntu with OpenJDK 11**
+**⚠️ Commands verified on Ubuntu with OpenJDK 11**  
+**🔧 Note:** Some build commands may fail due to JFrog repository issues in this fork. See troubleshooting section for workarounds.
 </commands>
 
 ## <workflows>
@@ -191,6 +193,11 @@ ethereum/p2p/src/main/java/.../rlpx/          # Network protocol
 java -version                # Verify Java 11+
 export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-arm64
 
+# JFrog Artifactory dependency issues (common in forks)
+# Error: "Could not find org.jfrog.buildinfo:build-info-extractor:2.22.0"
+# Workaround: Comment out artifactory plugin in build.gradle temporarily
+sed -i "s/id 'com.jfrog.artifactory'/\/\/id 'com.jfrog.artifactory'/" build.gradle
+
 # Gradle daemon issues  
 ./gradlew --stop            # Kill daemon
 ./gradlew clean build       # Fresh build
@@ -200,6 +207,11 @@ export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-arm64
 
 # Memory issues (large codebase)
 export GRADLE_OPTS="-Xmx4g -XX:MaxMetaspaceSize=1g"
+
+# Network/repository issues
+# Add alternative repositories to build.gradle repositories block:
+# maven { url "https://repo1.maven.org/maven2" }
+# maven { url "https://jcenter.bintray.com" }
 ```
 
 ### Runtime Issues
